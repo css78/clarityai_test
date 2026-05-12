@@ -1,0 +1,4 @@
+movie_title,release_year,critic_score_pct,top_critic_score,total_critic_reviews,ingestion_date,insertion_timestamp,update_timestamp
+Inception,2010,87,8.1,450,2026-05-12,2026-05-12T20:47:52,2026-05-12T20:47:52
+The Dark Knight,2008,94,8.6,350,2026-05-12,2026-05-12T20:47:52,2026-05-12T20:47:52
+Parasite,2019,99,9.5,475,2026-05-12,2026-05-12T20:47:52,2026-05-12T20:47:52

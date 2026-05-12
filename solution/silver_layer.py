@@ -1,0 +1,284 @@
+"""
+silver_layer.py
+===============
+Silver layer — cleaning, typing and standardisation as pure functions.
+
+Each function does exactly one thing and is independently testable.
+No classes, no state. Shared upsert logic lives in upsert_csv(),
+reused by gold_layer.py directly (DRY without inheritance).
+"""
+
+from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
+
+from config import (
+    BRONZE_PATHS,
+    CAST_MAPS,
+    MERGE_KEYS,
+    NULL_YEAR,
+    PROVIDERS,
+    RENAME_MAPS,
+    SILVER_PATHS,
+)
+
+
+# ---------------------------------------------------------------------------
+# Bronze reading
+# ---------------------------------------------------------------------------
+
+def read_latest_partition(bronze_root: Path, provider_key: str) -> pd.DataFrame:
+    """Reads the most recent Bronze partition for a provider.
+
+    Resolves the latest ingestion_date=YYYY-MM-DD folder by
+    lexicographic descending sort (works for ISO-8601 dates).
+
+    Args:
+        bronze_root: Root path of the partitioned Bronze provider folder.
+        provider_key: Used to build the expected CSV filename.
+
+    Returns:
+        DataFrame from the latest partition (all columns as str).
+
+    Raises:
+        FileNotFoundError: If no partitions exist under bronze_root.
+    """
+    partitions = sorted(
+        [d for d in bronze_root.iterdir() if d.name.startswith("ingestion_date=")],
+        key=lambda p: p.name,
+        reverse=True,
+    )
+    if not partitions:
+        raise FileNotFoundError(
+            f"No Bronze partitions found under: '{bronze_root}'. "
+            "Run the Bronze layer first."
+        )
+    return pd.read_csv(partitions[0] / f"{provider_key}.csv", dtype=str)
+
+
+# ---------------------------------------------------------------------------
+# Cleaning
+# ---------------------------------------------------------------------------
+
+def rename_columns(df: pd.DataFrame, rename_map: dict[str, str]) -> pd.DataFrame:
+    """Renames columns to the Silver standard vocabulary.
+
+    Only renames columns present in the DataFrame so partial
+    rename maps are safe.
+
+    Args:
+        df: Input DataFrame.
+        rename_map: Mapping of {original_name: silver_name}.
+
+    Returns:
+        DataFrame with renamed columns.
+    """
+    present = {k: v for k, v in rename_map.items() if k in df.columns}
+    return df.rename(columns=present)
+
+
+def trim_strings(df: pd.DataFrame) -> pd.DataFrame:
+    """Strips leading and trailing whitespace from all string columns.
+
+    Args:
+        df: Input DataFrame.
+
+    Returns:
+        DataFrame with trimmed string columns.
+    """
+    str_cols = df.select_dtypes(include="object").columns
+    df = df.copy()
+    df[str_cols] = df[str_cols].apply(lambda col: col.str.strip())
+    return df
+
+
+def cast_columns(df: pd.DataFrame, cast_map: dict[str, str]) -> pd.DataFrame:
+    """Casts columns to their target pandas dtypes.
+
+    Failed casts produce NaN — rows are never dropped.
+    Columns absent from the DataFrame are silently skipped.
+
+    Args:
+        df: Input DataFrame.
+        cast_map: Mapping of {column_name: pandas_dtype_string}.
+
+    Returns:
+        DataFrame with cast columns.
+    """
+    df = df.copy()
+    for col, dtype in cast_map.items():
+        if col not in df.columns:
+            continue
+        try:
+            df[col] = df[col].astype(dtype)
+        except (ValueError, TypeError):
+            pass
+    return df
+
+
+def apply_year_fallback(df: pd.DataFrame) -> pd.DataFrame:
+    """Replaces null release_year with NULL_YEAR placeholder ("N/A").
+
+    Called after cast_columns because a failed cast produces NaN,
+    which this function then catches and replaces.
+
+    Args:
+        df: Input DataFrame.
+
+    Returns:
+        DataFrame where null release_year is replaced with "N/A".
+    """
+    if "release_year" not in df.columns:
+        return df
+    df = df.copy()
+    df["release_year"] = df["release_year"].fillna(NULL_YEAR)
+    return df
+
+
+def clean(
+    df: pd.DataFrame,
+    rename_map: dict[str, str],
+    cast_map: dict[str, str],
+) -> pd.DataFrame:
+    """Runs the full Silver cleaning pipeline on a Bronze DataFrame.
+
+    Orchestrates: rename → trim → cast → year fallback.
+
+    Args:
+        df: Raw Bronze DataFrame.
+        rename_map: Column rename mapping for this provider.
+        cast_map: Target dtype mapping for this provider.
+
+    Returns:
+        Cleaned, typed and standardised Silver DataFrame.
+    """
+    df = rename_columns(df, rename_map)
+    df = trim_strings(df)
+    df = cast_columns(df, cast_map)
+    df = apply_year_fallback(df)
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Upsert — shared by Silver and Gold
+# ---------------------------------------------------------------------------
+
+def upsert_csv(
+    df_incoming: pd.DataFrame,
+    output_path: Path,
+    merge_keys: list[str] = MERGE_KEYS,
+) -> None:
+    """Writes a DataFrame to CSV using an upsert (merge) strategy.
+
+    First write: creates the file with both audit timestamps = now().
+
+    Subsequent writes:
+        MATCH on merge_keys    → update all fields;
+                                 insertion_timestamp preserved.
+        NO MATCH on merge_keys → insert new row; both timestamps = now().
+
+    Args:
+        df_incoming: Cleaned DataFrame to persist (no audit columns).
+        output_path: Destination CSV path.
+        merge_keys: Columns used to identify existing records.
+    """
+    now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not output_path.exists():
+        df_out = df_incoming.copy()
+        df_out["insertion_timestamp"] = now
+        df_out["update_timestamp"]    = now
+        df_out.to_csv(output_path, index=False, encoding="utf-8")
+        return
+
+    df_existing  = pd.read_csv(output_path, dtype=str)
+    df_new       = df_incoming.copy()
+    df_new["update_timestamp"] = now
+
+    existing_keys = _extract_keys(df_existing, merge_keys)
+    incoming_keys = _extract_keys(df_new, merge_keys)
+
+    merged = []
+
+    for _, row in df_existing.iterrows():
+        key = _row_key(row, merge_keys)
+        if key in incoming_keys:
+            new_row = df_new[_key_mask(df_new, key, merge_keys)].iloc[0].copy()
+            new_row["insertion_timestamp"] = row["insertion_timestamp"]
+            merged.append(new_row)
+        else:
+            merged.append(row)
+
+    for _, row in df_new.iterrows():
+        if _row_key(row, merge_keys) not in existing_keys:
+            row = row.copy()
+            row["insertion_timestamp"] = now
+            merged.append(row)
+
+    pd.DataFrame(merged).to_csv(output_path, index=False, encoding="utf-8")
+
+
+def _extract_keys(df: pd.DataFrame, merge_keys: list[str]) -> set[tuple]:
+    """Extracts the set of merge key tuples from a DataFrame."""
+    return {
+        tuple(str(row[k]) for k in merge_keys)
+        for _, row in df.iterrows()
+        if all(k in df.columns for k in merge_keys)
+    }
+
+
+def _row_key(row: pd.Series, merge_keys: list[str]) -> tuple:
+    """Returns the merge key tuple for a single row."""
+    return tuple(str(row[k]) for k in merge_keys)
+
+
+def _key_mask(df: pd.DataFrame, key: tuple, merge_keys: list[str]) -> pd.Series:
+    """Returns a boolean mask matching rows with the given key."""
+    mask = pd.Series([True] * len(df), index=df.index)
+    for col, val in zip(merge_keys, key):
+        mask &= df[col].astype(str) == str(val)
+    return mask
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def transform_provider(provider_key: str) -> pd.DataFrame:
+    """Runs the Bronze → Silver pipeline for one provider.
+
+    Steps: read latest Bronze partition → clean → upsert Silver CSV.
+
+    Args:
+        provider_key: Key identifying the provider.
+
+    Returns:
+        Cleaned Silver DataFrame.
+
+    Raises:
+        ValueError: If provider_key is not in RENAME_MAPS.
+        FileNotFoundError: If no Bronze partitions exist.
+    """
+    if provider_key not in RENAME_MAPS:
+        raise ValueError(f"Unknown provider key: '{provider_key}'")
+
+    df = read_latest_partition(BRONZE_PATHS[provider_key], provider_key)
+    df = clean(df, RENAME_MAPS[provider_key], CAST_MAPS[provider_key])
+    upsert_csv(df, SILVER_PATHS[provider_key])
+    print(f"[{provider_key}] Transformed → Silver.")
+    return df
+
+
+def run_silver() -> dict[str, pd.DataFrame]:
+    """Runs the Silver transformation layer for all providers.
+
+    Returns:
+        Dict mapping each provider key to its Silver DataFrame.
+    """
+    print("\nSilver layer — starting transformations\n")
+    results = {key: transform_provider(key) for key in PROVIDERS}
+    print(f"\n── Silver summary ──────────────────────────────────")
+    print(f"Transformed: {len(PROVIDERS)} providers")
+    return results

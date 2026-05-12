@@ -1,0 +1,4 @@
+movie_title,release_year,critic_score_pct,top_critic_score,total_critic_reviews,audience_avg_score,total_audience_ratings,international_box_office,production_budget,marketing_spend,domestic_box_office,total_box_office,total_investment,roi,insertion_timestamp,update_timestamp
+Inception,2010,87,8.1,450,9.1,1500000,535700000,160000000,100000000,292576195,828276195.0,260000000.0,2.1857,2026-05-12T20:47:52,2026-05-12T20:47:52
+Parasite,2019,99,9.5,475,9.0,800000,,,,53369749,,,,2026-05-12T20:47:52,2026-05-12T20:47:52
+The Dark Knight,2008,94,8.6,350,9.4,2200000,469700000,185000000,150000000,533345358,1003045358.0,335000000.0,1.9942,2026-05-12T20:47:52,2026-05-12T20:47:52
